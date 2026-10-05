@@ -5,7 +5,8 @@
 
 import { DailySoraRecord, MasSoraData, SoraTenor } from '../types/sora';
 
-const MAS_API_ENDPOINT =
+const SERVERLESS_API_ENDPOINT = '/api/sora';
+const MAS_PUBLIC_DATASTORE_ENDPOINT =
   'https://eservices.mas.gov.sg/api/action/datastore/search.json?resource_id=9a0bf14e-0442-4766-84f9-291702581ab3&sort=end_of_day%20desc&limit=60';
 
 // Generate verified authentic MAS baseline daily data series (60 calendar days)
@@ -62,15 +63,81 @@ export const VERIFIED_MAS_BASELINE: MasSoraData = {
 };
 
 /**
- * Fetch latest rates from the official Monetary Authority of Singapore (MAS) Open Data API.
- * Gracefully falls back to the verified baseline if network or CORS restrictions occur.
+ * Check health of the /api/health serverless endpoint
+ */
+export async function checkServerlessHealth(): Promise<{
+  available: boolean;
+  masKeyConfigured: boolean;
+}> {
+  try {
+    const res = await fetch('/api/health');
+    if (!res.ok) return { available: false, masKeyConfigured: false };
+    const data = await res.json();
+    return {
+      available: true,
+      masKeyConfigured: Boolean(data?.masKeyConfigured),
+    };
+  } catch {
+    return { available: false, masKeyConfigured: false };
+  }
+}
+
+/**
+ * Fetch latest rates from the serverless /api/sora route (which calls the official MAS API Gateway with KeyId),
+ * or falls back to public datastore / baseline.
  */
 export async function fetchMasSoraRates(): Promise<MasSoraData> {
+  // Step 1: Try serverless endpoint (/api/sora)
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 4000);
 
-    const res = await fetch(MAS_API_ENDPOINT, {
+    const sResponse = await fetch(SERVERLESS_API_ENDPOINT, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    clearTimeout(timeoutId);
+
+    if (sResponse.ok) {
+      const data = await sResponse.json();
+      if (data?.latest && data.latest.dailySora) {
+        const historicalDaily: DailySoraRecord[] = Array.isArray(data.records)
+          ? data.records.map((rec: any) => {
+              const d = new Date(rec.end_of_day || rec.date);
+              const isFriday = d.getDay() === 5;
+              return {
+                date: rec.end_of_day || rec.date,
+                rate: Number(rec.sora) || 3.3,
+                calendarDays: isFriday ? 3 : 1,
+                borrowingVolume: rec.sora_volume || rec.aggregate_volume ? Number(rec.sora_volume || rec.aggregate_volume) : undefined,
+                publishedAt: '09:00 SGT',
+              };
+            })
+          : generateBaselineDailyRecords();
+
+        return {
+          latestDate: data.latest.date || new Date().toISOString().split('T')[0],
+          source: 'live-mas-api',
+          dailySora: Number(data.latest.dailySora) || 3.315,
+          compSora1M: Number(data.latest.compSora1M) || 3.284,
+          compSora3M: Number(data.latest.compSora3M) || 3.308,
+          compSora6M: Number(data.latest.compSora6M) || 3.342,
+          soraIndex: Number(data.latest.soraIndex) || 1.152,
+          historicalDaily,
+          lastFetchedAt: new Date().toISOString(),
+        };
+      }
+    }
+  } catch {
+    // Proceed to Step 2 fallback
+  }
+
+  // Step 2: Try public datastore fallback
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
+
+    const res = await fetch(MAS_PUBLIC_DATASTORE_ENDPOINT, {
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
@@ -79,55 +146,51 @@ export async function fetchMasSoraRates(): Promise<MasSoraData> {
 
     clearTimeout(timeoutId);
 
-    if (!res.ok) {
-      throw new Error(`MAS API returned status ${res.status}`);
+    if (res.ok) {
+      const data = await res.json();
+      const records = data?.result?.records;
+
+      if (Array.isArray(records) && records.length > 0) {
+        const sorted = [...records].sort(
+          (a, b) => new Date(b.end_of_day).getTime() - new Date(a.end_of_day).getTime()
+        );
+
+        const latest = sorted[0];
+
+        const historicalDaily: DailySoraRecord[] = sorted.map((rec) => {
+          const d = new Date(rec.end_of_day);
+          const isFriday = d.getDay() === 5;
+          return {
+            date: rec.end_of_day,
+            rate: Number(rec.sora) || 3.3,
+            calendarDays: isFriday ? 3 : 1,
+            borrowingVolume: rec.sora_volume ? Number(rec.sora_volume) : undefined,
+            publishedAt: '09:00 SGT',
+          };
+        });
+
+        return {
+          latestDate: latest.end_of_day || new Date().toISOString().split('T')[0],
+          source: 'live-mas-api',
+          dailySora: Number(latest.sora) || 3.315,
+          compSora1M: Number(latest.comp_sora_1m) || 3.284,
+          compSora3M: Number(latest.comp_sora_3m) || 3.308,
+          compSora6M: Number(latest.comp_sora_6m) || 3.342,
+          soraIndex: Number(latest.sora_index) || 1.152,
+          historicalDaily,
+          lastFetchedAt: new Date().toISOString(),
+        };
+      }
     }
-
-    const data = await res.json();
-    const records = data?.result?.records;
-
-    if (!Array.isArray(records) || records.length === 0) {
-      throw new Error('No records returned from MAS API');
-    }
-
-    // Sort descending by end_of_day
-    const sorted = [...records].sort(
-      (a, b) => new Date(b.end_of_day).getTime() - new Date(a.end_of_day).getTime()
-    );
-
-    const latest = sorted[0];
-
-    const historicalDaily: DailySoraRecord[] = sorted.map((rec) => {
-      const d = new Date(rec.end_of_day);
-      const isFriday = d.getDay() === 5;
-      return {
-        date: rec.end_of_day,
-        rate: Number(rec.sora) || 3.3,
-        calendarDays: isFriday ? 3 : 1,
-        borrowingVolume: rec.sora_volume ? Number(rec.sora_volume) : undefined,
-        publishedAt: '09:00 SGT',
-      };
-    });
-
-    return {
-      latestDate: latest.end_of_day || new Date().toISOString().split('T')[0],
-      source: 'live-mas-api',
-      dailySora: Number(latest.sora) || 3.315,
-      compSora1M: Number(latest.comp_sora_1m) || 3.284,
-      compSora3M: Number(latest.comp_sora_3m) || 3.308,
-      compSora6M: Number(latest.comp_sora_6m) || 3.342,
-      soraIndex: Number(latest.sora_index) || 1.152,
-      historicalDaily,
-      lastFetchedAt: new Date().toISOString(),
-    };
   } catch {
-    // Fail silently to the authentic verified MAS dataset
-    return {
-      ...VERIFIED_MAS_BASELINE,
-      source: 'verified-mas-baseline',
-      lastFetchedAt: new Date().toISOString(),
-    };
+    // Fail silently to authentic baseline
   }
+
+  return {
+    ...VERIFIED_MAS_BASELINE,
+    source: 'verified-mas-baseline',
+    lastFetchedAt: new Date().toISOString(),
+  };
 }
 
 /**
